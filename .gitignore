@@ -1,0 +1,24 @@
+# secrets
+.env
+
+# android-mcp-server (cloned by setup.sh)
+android-mcp-server/
+android-mcp-server/.venv/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# logs
+logs/
+*.log
+
+# temp screenshots
+/tmp/screen.png
+
+# OS
+.DS_Store
+Thumbs.db
