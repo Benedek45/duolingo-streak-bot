@@ -1,9 +1,13 @@
 # secrets
 .env
 
-# android-mcp-server (cloned by setup.sh)
-android-mcp-server/
-android-mcp-server/.venv/
+# browser profile
+.browser-profile/
+.browser-profile-*/
+mcp/playwright-mcp.generated.json
+
+# android leftovers
+apks/
 
 # python
 __pycache__/
@@ -17,7 +21,7 @@ logs/
 *.log
 
 # temp screenshots
-/tmp/screen.png
+turn-*.png
 
 # OS
 .DS_Store

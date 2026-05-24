@@ -1,137 +1,531 @@
 """
-Duolingo Streak Agent — OpenAI Agents SDK edition
-Uses minhalvp/android-mcp-server via MCPServerStdio.
-The SDK handles the tool loop, message history, and MCP bridging automatically.
+Duolingo Streak Agent - Playwright MCP edition.
+
+The Python code runs the OpenAI Agents SDK and gives the model Microsoft's
+official Playwright MCP server as its browser tool provider.
 """
 
 import asyncio
+import base64
+import json
+import mimetypes
 import os
-import subprocess
-import time
+import shutil
+from pathlib import Path
 
 from openai import AsyncOpenAI
-from agents import Agent, Runner
+from openai.resources.chat.completions import AsyncCompletions
+from agents import Agent, ModelSettings, Runner, function_tool
 from agents.mcp import MCPServerStdio
 from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
+from agents.stream_events import AgentUpdatedStreamEvent, RawResponsesStreamEvent, RunItemStreamEvent
 
-# ── Config ─────────────────────────────────────────────────────────────────────
+
+ROOT = Path(__file__).resolve().parent
+MCP_DIR = ROOT / "mcp"
+LOG_DIR = ROOT / "logs"
+CONFIG_PATH = MCP_DIR / "playwright-mcp.generated.json"
+
+
+def load_dotenv() -> None:
+    env_path = ROOT / ".env"
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def find_browser() -> str:
+    configured = os.environ.get("BROWSER_EXECUTABLE")
+    if configured:
+        return configured
+    for candidate in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable"):
+        path = shutil.which(candidate)
+        if path:
+            return path
+    raise RuntimeError("No Chromium/Chrome executable found. Install Chromium or set BROWSER_EXECUTABLE.")
+
+
+load_dotenv()
+
 OPENCODE_GO_API_KEY = os.environ["OPENCODE_GO_API_KEY"]
-DUOLINGO_EMAIL      = os.environ["DUOLINGO_EMAIL"]
-DUOLINGO_PASSWORD   = os.environ["DUOLINGO_PASSWORD"]
+DUOLINGO_EMAIL = os.environ["DUOLINGO_EMAIL"]
+DUOLINGO_PASSWORD = os.environ["DUOLINGO_PASSWORD"]
 
-ADB_HOST   = os.environ.get("ADB_HOST", "localhost")
-ADB_PORT   = os.environ.get("ADB_PORT", "5555")
-ADB_TARGET = f"{ADB_HOST}:{ADB_PORT}"
+DUOLINGO_URL = os.environ.get("DUOLINGO_URL", "https://www.duolingo.com")
+AGENT_MODEL = os.environ.get("AGENT_MODEL", "deepseek-v4-flash")
+VISION_MODEL = os.environ.get("VISION_MODEL", "qwen3.5-plus")
+MAX_TURNS = int(os.environ.get("MAX_TURNS", "150"))
+MODEL_MAX_TOKENS = int(os.environ.get("MODEL_MAX_TOKENS", "1200"))
+VISION_MAX_TOKENS = int(os.environ.get("VISION_MAX_TOKENS", "500"))
+MODEL_INCLUDE_USAGE = env_bool("MODEL_INCLUDE_USAGE", True)
+QWEN_ENABLE_THINKING = env_bool("QWEN_ENABLE_THINKING", False)
+DRY_RUN = env_bool("AGENT_DRY_RUN", False)
 
-MCP_SERVER_DIR = os.path.abspath(
-    os.environ.get("MCP_SERVER_DIR", "./android-mcp-server")
+WINDOW_WIDTH = int(os.environ.get("BROWSER_WIDTH", "1366"))
+WINDOW_HEIGHT = int(os.environ.get("BROWSER_HEIGHT", "768"))
+CHROME_MAJOR = os.environ.get("BROWSER_CHROME_MAJOR", "136")
+WINDOWS_CHROME_UA = os.environ.get(
+    "BROWSER_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    f"Chrome/{CHROME_MAJOR}.0.0.0 Safari/537.36",
 )
+HEADLESS = env_bool(
+    "BROWSER_HEADLESS",
+    not bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")),
+)
+USER_DATA_DIR = Path(os.environ.get("BROWSER_USER_DATA_DIR", ROOT / ".browser-profile"))
+MCP_VISION = env_bool("MCP_VISION", False)
 
-MAX_TURNS = 40
-# ──────────────────────────────────────────────────────────────────────────────
+# Fail closed. Add extra hosts with DUOLINGO_ALLOWED_HOSTS if Duolingo introduces
+# a new CDN/auth host. Host entries may be exact names or suffixes prefixed by a dot.
+DEFAULT_ALLOWED_HOSTS = [
+    "duolingo.com",
+    ".duolingo.com",
+    "d1vq87e9lcf771.cloudfront.net",
+    "d35aaqx5ub95lt.cloudfront.net",
+    "d2pur3iezf4d1j.cloudfront.net",
+    "d3kwyfyztuo0xs.cloudfront.net",
+]
+ALLOWED_HOSTS = [
+    host.strip().lower()
+    for host in os.environ.get("DUOLINGO_ALLOWED_HOSTS", ",".join(DEFAULT_ALLOWED_HOSTS)).split(",")
+    if host.strip()
+]
+
+BLOCKED_MCP_TOOLS = {
+    "browser_run_code_unsafe",
+    "browser_file_upload",
+    "browser_drop",
+}
 
 
 SYSTEM_PROMPT = """
-You are controlling a real Android phone to complete one Duolingo lesson.
-You have NO memory of previous sessions — every run is completely independent.
+You control Duolingo in a desktop Chrome browser through the Playwright MCP tools.
+Complete any one Duolingo daily task, quest, practice, story, or lesson to keep
+the streak alive, then stop. It does not matter which task you choose; if there
+are multiple options, pick the first/easiest actionable one and continue. It is
+OK if the task was already completed before; repeat a completed lesson/practice
+if that is the fastest available option.
 
-═══ TOOLS ═══
-- get_screenshot     → see the current screen (call this after every tap)
-- get_uilayout       → list all clickable elements with exact centre coordinates
-- execute_adb_shell_command(command) → run any ADB shell command
-- get_packages       → check installed apps
+The available browser tools are provided by MCP. Use the browser_* tools directly:
+navigate, snapshot, click, fill form, press key, wait, screenshot, and related tools.
+Prefer accessibility snapshots and exact element refs over coordinate clicks.
 
-═══ YOUR TASK (3 phases) ═══
+Cost and context rules:
+- Keep messages short. Do not narrate obvious steps.
+- Prefer browser_evaluate with `() => window.__duolingoCompactView()` to inspect
+  the page. It returns compact visible text and actionable controls.
+- Do not call browser_snapshot after every click. Full snapshots are expensive.
+  Use browser_snapshot only when compact view is insufficient or a ref is stale.
+- Do not take screenshots unless there is a CAPTCHA/security challenge or the
+  page cannot be understood from compact text.
+- If visual understanding is truly necessary, call browser_take_screenshot first,
+  then call analyze_latest_screenshot_with_qwen with one short question. This is
+  expensive; use it only as a fallback.
 
-PHASE 1 — ASSESS & LOGIN IF NEEDED
-Call get_screenshot first. Look at what's on screen:
-- Login / welcome screen → log in with the credentials below
-- Duolingo home (owl, streak count, lesson map) → skip to Phase 2
-- Loading / splash → wait and call get_screenshot again
-Credentials (only if login screen is visible):
-  email: {email}
-  password: {password}
-  To type: execute_adb_shell_command with "input text 'VALUE'"
+Batching:
+- Batch simple deterministic actions when the answer/action sequence is already
+  clear, especially tapping multiple word-bank tokens in order or pressing
+  Continue/Check after an answer is complete.
+- For known word-bank sequences, prefer one browser_evaluate call that clicks
+  all known token selectors in order, then click Check/Continue. Example: click
+  token A, token B, token C in one evaluate call instead of three separate
+  browser_click calls.
+- Use a fresh compact view before deciding the batch; use a snapshot only if the
+  compact view is insufficient. Do not batch across unknown page transitions or
+  across a state that needs feedback from Duolingo.
+- If one item in a batch might be missing or ambiguous, stop batching and use
+  single tool calls with a new snapshot.
+- After you submit an answer and Duolingo shows correct-answer feedback, the
+  browser may automatically click TOVÁBB after a short random delay. Do not spend
+  a separate model turn clicking TOVÁBB from correct-answer feedback; wait briefly
+  and inspect the next question instead. Still handle lesson-complete/reward
+  screens yourself.
 
-PHASE 2 — REACH THE HOME SCREEN
-Use get_uilayout to find the Home tab and tap it if not already there.
-Dismiss any popup, modal, or "welcome back" overlay first.
+Important environment constraints:
+- The browser is configured to look like Chrome on Windows 11.
+- Browser network requests are allowlisted to Duolingo-owned/API hosts and known
+  Duolingo CDN hosts. Do not try to browse elsewhere.
+- If a required Duolingo asset is blocked, report the blocked host instead of
+  working around the guardrail.
 
-PHASE 3 — COMPLETE ONE LESSON
-Tap the first available (non-locked) lesson on the skill tree or the daily
-challenge if highlighted. Use get_uilayout to get exact coordinates — prefer
-this over guessing from screenshots. After each tap call get_screenshot to
-confirm the result before the next action. Tap the green CONTINUE/CHECK/NEXT
-button after each answer. When the XP/completion screen appears, stop.
+Credentials, only if the account is logged out:
+- email: {email}
+- password: {password}
 
-═══ TAPPING ═══
-execute_adb_shell_command with command = "input tap X Y"
-Use coordinates from get_uilayout where possible — more reliable than vision.
-"""
+Task flow:
+1. Navigate to {url}.
+2. If logged out, log in with the credentials above.
+3. Dismiss cookie banners, notification prompts, modals, ads, or free-trial popups.
+4. Reach the learning/home path and start any visible unlocked or completed
+   skill-path node, daily task, quest, practice, story, or normal lesson. Do not
+   spend time deciding between tasks. Repeating an already completed lesson is
+   allowed and preferred over searching.
+5. Answer prompts using the page content. Continue/check/next until an XP,
+   streak, daily-task-complete, or lesson-complete screen appears.
+6. Stop immediately once one task or lesson is complete.
+
+Task selection rules:
+- Try at most 3 start attempts total.
+- Find the task in the TANULÁS section (`/learn`). Do not use the left/sidebar
+  GYAKORLÁS menu item because that opens Practice Hub and is usually not useful.
+  This is different from the GYAKORLÁS: +5 PONT button/link inside a TANULÁS
+  skill-path popup; that one is useful and should be clicked when visible because
+  it starts a repeatable lesson/practice task.
+- First try the first visible unlocked/completed skill-path lesson node on /learn.
+- If that does not open a task within 10 seconds, try the first visible story or
+  practice node.
+- If that also fails, use Practice Hub or Quests and click the first actionable
+  task, including tasks already done before.
+- Do not loop between pages looking for a better task. After 3 failed start
+  attempts, stop and report what failed.
+
+Return success only after one task or lesson is complete. If there is a CAPTCHA,
+security challenge, payment wall, or blocked-host issue, stop and explain the reason.
+""".strip()
+
+
+def redact(value: object) -> str:
+    text = value if isinstance(value, str) else json.dumps(to_plain_data(value), default=str)
+    replacements = {
+        OPENCODE_GO_API_KEY: "<opencode-api-key>",
+        DUOLINGO_PASSWORD: "<duolingo-password>",
+        DUOLINGO_EMAIL: "<duolingo-email>",
+    }
+    for secret, label in replacements.items():
+        if secret:
+            text = text.replace(secret, label)
+    return text
+
+
+def to_plain_data(value: object) -> object:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(exclude_unset=True)
+    if isinstance(value, dict):
+        return {key: to_plain_data(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [to_plain_data(item) for item in value]
+    return value
+
+
+def short_text(value: object, limit: int = 2400) -> str:
+    text = redact(value)
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit]}... <truncated {len(text) - limit} chars>"
+
+
+def raw_attr(value: object, *names: str) -> object | None:
+    for name in names:
+        if isinstance(value, dict) and name in value:
+            return value[name]
+        if hasattr(value, name):
+            return getattr(value, name)
+    return None
+
+
+def tool_call_summary(item: object) -> str:
+    raw = raw_attr(item, "raw_item") or item
+    name = raw_attr(item, "tool_name") or raw_attr(raw, "name") or raw_attr(raw, "tool_name")
+    title = raw_attr(item, "title") or raw_attr(raw, "title")
+    arguments = raw_attr(raw, "arguments", "input")
+    label = name or title or type(raw).__name__
+    if arguments is None:
+        return str(label)
+    return f"{label} {short_text(arguments, 1200)}"
+
+
+async def print_streamed_events(result) -> None:
+    print("[Agent] Streaming model output and browser tool activity. Hidden chain-of-thought is not exposed.")
+    last_usage = None
+    async for event in result.stream_events():
+        if isinstance(event, RawResponsesStreamEvent):
+            usage = getattr(event.data, "usage", None)
+            if usage is not None and usage != last_usage:
+                last_usage = usage
+                print(f"\n[Usage] {short_text(usage, 1000)}", flush=True)
+            delta = getattr(event.data, "delta", None)
+            if isinstance(delta, str) and delta:
+                print(delta, end="", flush=True)
+            continue
+
+        if isinstance(event, AgentUpdatedStreamEvent):
+            print(f"\n[Agent] switched to {event.new_agent.name}", flush=True)
+            continue
+
+        if not isinstance(event, RunItemStreamEvent):
+            continue
+
+        if event.name == "tool_called":
+            print(f"\n[Tool call] {tool_call_summary(event.item)}", flush=True)
+        elif event.name == "tool_output":
+            output = raw_attr(event.item, "output")
+            print(f"\n[Tool output] {short_text(output)}", flush=True)
+        elif event.name == "mcp_list_tools":
+            print("\n[MCP] listed browser tools", flush=True)
+        elif event.name == "reasoning_item_created":
+            print("\n[Reasoning] hidden by the model/API; showing actions and final output instead", flush=True)
+        elif event.name == "message_output_created":
+            print("\n[Message]", flush=True)
+
+
+def allowed_origins() -> list[str]:
+    origins = {"https://duolingo.com", "https://www.duolingo.com"}
+    for host in ALLOWED_HOSTS:
+        if host.startswith("."):
+            continue
+        origins.add(f"https://{host}")
+    return sorted(origins)
+
+
+def write_mcp_config() -> None:
+    MCP_DIR.mkdir(exist_ok=True)
+    LOG_DIR.mkdir(exist_ok=True)
+
+    browser_args = [
+        "--disable-blink-features=AutomationControlled",
+        "--disable-dev-shm-usage",
+        "--disable-infobars",
+        f"--window-size={WINDOW_WIDTH},{WINDOW_HEIGHT}",
+        "--lang=en-US",
+    ]
+
+    config = {
+        "browser": {
+            "browserName": "chromium",
+            "userDataDir": str(USER_DATA_DIR),
+            "launchOptions": {
+                "headless": HEADLESS,
+                "executablePath": find_browser(),
+                "args": browser_args,
+            },
+            "contextOptions": {
+                "userAgent": WINDOWS_CHROME_UA,
+                "locale": "en-US",
+                "timezoneId": os.environ.get("BROWSER_TIMEZONE", "America/New_York"),
+                "viewport": {"width": WINDOW_WIDTH, "height": WINDOW_HEIGHT},
+                "screen": {"width": WINDOW_WIDTH, "height": WINDOW_HEIGHT},
+                "colorScheme": "light",
+            },
+            "initScript": [
+                str(MCP_DIR / "windows-chrome-spoof.js"),
+                str(MCP_DIR / "duolingo-compact-view.js"),
+                str(MCP_DIR / "duolingo-auto-continue.js"),
+            ],
+            "initPage": [str(MCP_DIR / "duolingo-network-guard.ts")],
+        },
+        "capabilities": ["core"] + (["vision"] if MCP_VISION else []),
+        "network": {"allowedOrigins": allowed_origins()},
+        "outputDir": str(LOG_DIR),
+        "timeouts": {"action": 10000, "navigation": 90000},
+    }
+    if MCP_VISION:
+        config["imageResponses"] = "allow"
+    CONFIG_PATH.write_text(json.dumps(config, indent=2) + "\n")
+
+
+def model_settings() -> ModelSettings:
+    extra_body = {}
+    if AGENT_MODEL.startswith("qwen"):
+        # Qwen hybrid-thinking models can spend many hidden reasoning tokens.
+        # Keep this off for browser automation unless explicitly enabled.
+        extra_body["enable_thinking"] = QWEN_ENABLE_THINKING
+    return ModelSettings(
+        max_tokens=MODEL_MAX_TOKENS,
+        include_usage=MODEL_INCLUDE_USAGE,
+        parallel_tool_calls=False,
+        extra_body=extra_body or None,
+    )
+
+
+def is_empty_assistant_message(message: dict) -> bool:
+    if message.get("role") != "assistant" or message.get("tool_calls"):
+        return False
+    content = message.get("content")
+    return content is None or content == "" or content == []
+
+
+def plain_tool_content(content: object) -> object:
+    if not isinstance(content, list):
+        return content
+    text_parts = []
+    for item in content:
+        if isinstance(item, dict) and item.get("type") == "text":
+            text_parts.append(str(item.get("text", "")))
+        else:
+            text_parts.append(json.dumps(item, default=str))
+    return "\n".join(part for part in text_parts if part)
+
+
+def sanitize_deepseek_messages(messages: list[dict]) -> list[dict]:
+    sanitized = []
+    for message in messages:
+        if is_empty_assistant_message(message):
+            continue
+        if message.get("role") == "tool" and isinstance(message.get("content"), list):
+            message = {**message, "content": plain_tool_content(message["content"])}
+        sanitized.append(message)
+    return sanitized
+
+
+def install_deepseek_compat() -> None:
+    if getattr(AsyncCompletions.create, "_duolingo_deepseek_compat", False):
+        return
+    original_create = AsyncCompletions.create
+
+    async def create_with_deepseek_compat(self, *args, **kwargs):
+        model = str(kwargs.get("model") or "")
+        if model.startswith("deepseek") and isinstance(kwargs.get("messages"), list):
+            kwargs = {**kwargs, "messages": sanitize_deepseek_messages(kwargs["messages"])}
+        return await original_create(self, *args, **kwargs)
+
+    create_with_deepseek_compat._duolingo_deepseek_compat = True
+    AsyncCompletions.create = create_with_deepseek_compat
+
+
+def latest_screenshot() -> Path | None:
+    candidates = []
+    for pattern in ("*.png", "*.jpg", "*.jpeg", "**/*.png", "**/*.jpg", "**/*.jpeg"):
+        candidates.extend(LOG_DIR.glob(pattern))
+    files = [path for path in candidates if path.is_file()]
+    if not files:
+        return None
+    return max(files, key=lambda path: path.stat().st_mtime)
+
+
+@function_tool
+async def analyze_latest_screenshot_with_qwen(question: str) -> str:
+    """Analyze the latest browser screenshot with the Qwen vision model.
+
+    Use only after calling browser_take_screenshot and only when DOM text or
+    accessibility snapshots are not enough, such as CAPTCHA or image-only tasks.
+
+    Args:
+        question: Short, specific question about the screenshot.
+    """
+    image_path = latest_screenshot()
+    if image_path is None:
+        return "No screenshot file was found. Call browser_take_screenshot first, then retry this tool."
+
+    mime_type = mimetypes.guess_type(image_path.name)[0] or "image/png"
+    image_b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
+    client = AsyncOpenAI(api_key=OPENCODE_GO_API_KEY, base_url="https://opencode.ai/zen/go/v1")
+    request = {
+        "model": VISION_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Answer this Duolingo browser screenshot question concisely. "
+                            "Do not describe irrelevant UI. Question: " + question
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime_type};base64,{image_b64}",
+                            "detail": "low",
+                        },
+                    },
+                ],
+            }
+        ],
+        "max_tokens": VISION_MAX_TOKENS,
+    }
+    if VISION_MODEL.startswith("qwen"):
+        request["extra_body"] = {"enable_thinking": False}
+    response = await client.chat.completions.create(**request)
+    answer = response.choices[0].message.content or ""
+    return f"Qwen vision answer from {image_path.name}: {answer.strip()}"
+
+
+def mcp_params() -> dict:
+    return {
+        "command": "npx",
+        "args": ["--yes", "@playwright/mcp@latest", "--config", str(CONFIG_PATH)],
+        "env": {
+            **os.environ,
+            "CHROME_MAJOR": CHROME_MAJOR,
+            "BROWSER_USER_AGENT": WINDOWS_CHROME_UA,
+            "BROWSER_WIDTH": str(WINDOW_WIDTH),
+            "BROWSER_HEIGHT": str(WINDOW_HEIGHT),
+            "DUOLINGO_ALLOWED_HOSTS": ",".join(ALLOWED_HOSTS),
+        },
+    }
+
+
+async def dry_run() -> bool:
+    write_mcp_config()
+    async with MCPServerStdio(
+        params=mcp_params(),
+        cache_tools_list=True,
+        client_session_timeout_seconds=90,
+        tool_filter={"blocked_tool_names": sorted(BLOCKED_MCP_TOOLS)},
+    ) as mcp:
+        tools = await mcp.list_tools()
+        print("[MCP] Playwright MCP started")
+        print(f"[MCP] config: {CONFIG_PATH}")
+        print(f"[MCP] allowed hosts: {', '.join(ALLOWED_HOSTS)}")
+        print(f"[MCP] tools ({len(tools)}):")
+        for tool in tools:
+            print(f"  - {tool.name}")
+    return True
 
 
 async def run_agent() -> bool:
-    # 1. Connect ADB to Docker emulator
-    subprocess.run(["adb", "connect", ADB_TARGET], capture_output=True)
-    print(f"[ADB] Connected to {ADB_TARGET}")
-    time.sleep(2)
+    write_mcp_config()
+    if DRY_RUN:
+        return await dry_run()
 
-    # 2. Launch Duolingo
-    subprocess.run(
-        ["adb", "-s", ADB_TARGET, "shell",
-         "monkey", "-p", "com.duolingo",
-         "-c", "android.intent.category.LAUNCHER", "1"],
-        capture_output=True,
-    )
-    print("[Agent] Duolingo launched — waiting 4s...")
-    time.sleep(4)
+    install_deepseek_compat()
+    client = AsyncOpenAI(api_key=OPENCODE_GO_API_KEY, base_url="https://opencode.ai/zen/go/v1")
+    model = OpenAIChatCompletionsModel(model=AGENT_MODEL, openai_client=client)
 
-    # 3. OpenCode Go client — OpenAI-compatible endpoint
-    #    OpenAIChatCompletionsModel is required for non-OpenAI providers;
-    #    the default Responses model only works with OpenAI's own API.
-    client = AsyncOpenAI(
-        api_key=OPENCODE_GO_API_KEY,
-        base_url="https://opencode.ai/zen/go/v1",
-    )
-    model = OpenAIChatCompletionsModel(
-        # vision confirmed working — swap via AGENT_MODEL env var if needed
-        model=os.environ.get("AGENT_MODEL", "kimi-k2.6"),
-        openai_client=client,
-    )
-
-    # 4. Spin up the android-mcp-server via stdio
-    #    cache_tools_list=True avoids re-fetching the tool list on every turn
     async with MCPServerStdio(
-        params={
-            "command": "uv",
-            "args": ["--directory", MCP_SERVER_DIR, "run", "server.py"],
-            "env": {**os.environ, "ANDROID_SERIAL": ADB_TARGET},
-        },
+        params=mcp_params(),
         cache_tools_list=True,
+        client_session_timeout_seconds=90,
+        tool_filter={"blocked_tool_names": sorted(BLOCKED_MCP_TOOLS)},
     ) as mcp:
-
         agent = Agent(
-            name="duolingo-streak",
+            name="duolingo-browser-streak",
             instructions=SYSTEM_PROMPT.format(
                 email=DUOLINGO_EMAIL,
                 password=DUOLINGO_PASSWORD,
+                url=DUOLINGO_URL,
             ),
+            tools=[analyze_latest_screenshot_with_qwen],
             mcp_servers=[mcp],
             model=model,
+            model_settings=model_settings(),
         )
-
-        # 5. Run — the SDK handles the tool loop, message history, everything.
-        #    Fresh context every time: Runner.run() always starts a new thread.
-        result = await Runner.run(
+        result = Runner.run_streamed(
             agent,
-            input="Start. Call get_screenshot to see the current state and begin.",
+            input="Start now. Navigate to Duolingo, complete any available daily task or lesson, then stop.",
             max_turns=MAX_TURNS,
         )
-
-        print(f"\n[Agent] ✅ Done — {result.final_output}")
+        await print_streamed_events(result)
+        print(f"\n[Agent] {result.final_output}")
         return True
 
 
 if __name__ == "__main__":
     success = asyncio.run(run_agent())
-    exit(0 if success else 1)
+    raise SystemExit(0 if success else 1)

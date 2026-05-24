@@ -1,123 +1,95 @@
 # Duolingo Streak Agent
 
-Keeps your Duolingo streak alive by running a daily lesson inside a
-Dockerised Android emulator, controlled by Kimi K2.5 (vision + tool-use)
-via the OpenCode Go API.
+Keeps a Duolingo streak alive from a browser session. No Android, ADB,
+emulator, Docker, Waydroid, or Cuttlefish is used.
 
-```
-┌─────────────┐   cron / CI   ┌──────────────┐   ADB tap   ┌───────────────────┐
-│  run.sh     │ ────────────► │  agent.py    │ ──────────► │ Docker Android    │
-│  (daily)    │               │  (Python)    │ ◄────────── │ (budtmo image)    │
-└─────────────┘               │              │  screenshot │                   │
-                               │  calls Kimi  │             │  Duolingo app     │
-                               │  K2.5 API    │             └───────────────────┘
-                               └──────────────┘
-```
-
----
+The agent uses Microsoft's official `@playwright/mcp` server through the OpenAI
+Agents SDK. That means the model receives real MCP browser tools in context,
+including their names, descriptions, and schemas.
 
 ## Prerequisites
 
-- Docker + Docker Compose
 - Python 3.10+
-- `adb` on your host machine (`brew install android-platform-tools` or `apt install adb`)
-- An OpenCode Go subscription → API key from https://opencode.ai/auth
-
----
+- Node.js 18+ with `npx`
+- Chromium installed on the machine (`/usr/bin/chromium` on Raspberry Pi OS)
+- An OpenCode Go API key from https://opencode.ai/auth
 
 ## Setup
 
-### 1. Clone & configure
-
 ```bash
-git clone <this-repo>
-cd duolingo-agent
+./setup.sh
 cp .env.example .env
-# Edit .env — add your OpenCode Go key and Duolingo credentials
 ```
 
-### 2. Start the Android emulator
+Fill `.env` with:
 
 ```bash
-docker compose up -d
+OPENCODE_GO_API_KEY=...
+DUOLINGO_EMAIL=...
+DUOLINGO_PASSWORD=...
 ```
 
-The first boot takes **2-3 minutes**. Watch it boot at http://localhost:6080
-(noVNC browser UI — no extra software needed).
-
-### 3. Install Duolingo & log in (one-time)
+Optional settings:
 
 ```bash
-# Wait until healthy
-docker compose ps   # should show "healthy"
-
-# Connect ADB
-adb connect localhost:5555
-
-# Option A: sideload APK (download from APKPure/APKMirror and put in ./apks/)
-adb install apks/duolingo.apk
-
-# Option B: install from Play Store via the noVNC browser UI at localhost:6080
-# (PICO GAPPS are pre-installed in the budtmo image)
+AGENT_MODEL=deepseek-v4-flash
+VISION_MODEL=qwen3.5-plus
+MAX_TURNS=150
+MODEL_MAX_TOKENS=1200
+VISION_MAX_TOKENS=500
+MODEL_INCLUDE_USAGE=true
+QWEN_ENABLE_THINKING=false
+MCP_VISION=false
+BROWSER_EXECUTABLE=/usr/bin/chromium
+BROWSER_HEADLESS=true
+BROWSER_USER_DATA_DIR=.browser-profile
+DUOLINGO_URL=https://www.duolingo.com
+DUOLINGO_ALLOWED_HOSTS=duolingo.com,.duolingo.com,d1vq87e9lcf771.cloudfront.net,d35aaqx5ub95lt.cloudfront.net,d2pur3iezf4d1j.cloudfront.net,d3kwyfyztuo0xs.cloudfront.net
 ```
 
-Log in to Duolingo **manually once** via the noVNC UI.
-The `android-data` Docker volume persists your session — you won't need to log in again.
-
-### 4. Install Python deps
+## Run
 
 ```bash
-pip install requests
-```
-
-### 5. Test a run
-
-```bash
-chmod +x run.sh
 ./run.sh
 ```
 
-You should see the agent taking screenshots and tapping through a lesson.
-
----
-
-## Scheduling (daily cron)
+For an MCP smoke test that starts the Playwright MCP server and lists available
+browser tools without calling the model:
 
 ```bash
-crontab -e
+AGENT_DRY_RUN=1 ./run.sh
 ```
 
-Add (runs at 9 AM every day):
+## How It Works
 
+1. `agent.py` generates `mcp/playwright-mcp.generated.json` from `.env`.
+2. The Agents SDK starts `npx --yes @playwright/mcp@latest --config ...` over stdio.
+3. The agent receives Playwright MCP tools such as `browser_navigate`,
+   `browser_snapshot`, `browser_click`, and `browser_fill_form`.
+   Unsafe/file-transfer tools are filtered out before the model sees them.
+4. Chromium is configured to look like Windows 11 Chrome with a Windows user
+   agent, `navigator.platform`, `navigator.userAgentData`, language, hardware,
+   `navigator.webdriver`, screen, and WebGL spoofing.
+5. A Playwright route guard aborts browser requests whose host is not in
+   `DUOLINGO_ALLOWED_HOSTS`. The MCP server's own `allowedOrigins` option is also
+   set, but the route guard is the stricter fail-closed protection.
+6. Browser profile data persists in `.browser-profile`.
+7. A compact page helper, `window.__duolingoCompactView()`, is injected so the
+   model can inspect Duolingo without repeatedly sending full YAML snapshots.
+8. The main browser agent uses `AGENT_MODEL` for cheap text/tool control.
+   If visual understanding is truly necessary, it can call
+   `analyze_latest_screenshot_with_qwen`, which sends only the latest screenshot
+   to `VISION_MODEL`.
+9. MCP outputs are stored under `logs/`. MCP vision/image responses stay disabled
+   by default; the separate Qwen vision fallback is used only on demand.
+
+## Scheduling
+
+Add this to `crontab -e` to run daily at 9 AM:
+
+```cron
+0 9 * * * cd /home/benedek/duolingo && ./run.sh >> logs/agent.log 2>&1
 ```
-0 9 * * * cd /path/to/duolingo-agent && ./run.sh >> logs/agent.log 2>&1
-```
 
-Or use GitHub Actions with a `schedule` trigger if you run this in CI.
-
----
-
-## How it works
-
-1. `run.sh` loads `.env` and waits for ADB to be ready.
-2. `agent.py` connects to the emulator, launches Duolingo via `adb shell monkey`.
-3. In a loop (max 40 turns):
-   - Takes a screenshot via `adb screencap`
-   - Sends it to Kimi K2.5 as a base64 image with "what to do next?"
-   - Kimi replies with `{"action": "tap", "x": 540, "y": 1200, "reason": "..."}` or `{"action": "done"}`
-   - Agent executes the tap with ±6px jitter and 0.4–1.1s random delay
-4. Exits with code 0 on success, 1 on failure.
-
----
-
-## Notes
-
-- **Streak freeze safety**: if the agent fails (network issue, unexpected screen),
-  it exits with code 1. You can set up a notification on failure so you can do it manually.
-- **CAPTCHA**: Kimi K2.5 handles simple image CAPTCHAs. If Duolingo serves a hard
-  CAPTCHA, the agent may fail — this is rare for the mobile app.
-- **KVM**: The `budtmo/docker-android` image uses KVM for hardware acceleration.
-  Make sure KVM is available on your host (`ls /dev/kvm`). On most Linux hosts this
-  works out of the box. On a VPS, check that nested virtualisation is enabled.
-- **No KVM fallback**: If KVM isn't available, replace the image with
-  `budtmo/docker-android:emulator_14.0_noKVM` (slower but works anywhere).
+If you want to see the browser on the desktop, set `BROWSER_HEADLESS=false` in
+`.env` and run it from a graphical session.

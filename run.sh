@@ -1,33 +1,32 @@
 #!/usr/bin/env bash
-# run.sh — load env vars and run the Duolingo agent
+# run.sh — load env vars and run the browser Duolingo agent
 # Usage: ./run.sh
 # Cron (daily at 9am): 0 9 * * * cd /path/to/duolingo-agent && ./run.sh >> logs/agent.log 2>&1
 
 set -euo pipefail
 
-# Load .env
+# Load .env without overwriting one-off command-line overrides.
 if [ -f .env ]; then
-  export $(grep -v '^#' .env | xargs)
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ -z "$line" || "$line" == \#* || "$line" != *=* ]] && continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    if [ -z "${!key+x}" ]; then
+      export "$key=$value"
+    fi
+  done < .env
 fi
 
-# Wait for emulator to be healthy before running (useful on cold start)
-echo "[run.sh] Waiting for emulator ADB..."
-for i in $(seq 1 20); do
-  if adb -s "${ADB_HOST:-localhost}:${ADB_PORT:-5555}" get-state 2>/dev/null | grep -q "device"; then
-    echo "[run.sh] Emulator ready."
-    break
-  fi
-  echo "[run.sh] Not ready yet ($i/20)..."
-  sleep 10
-done
+mkdir -p logs
 
 python3 agent.py
 STATUS=$?
 
 if [ $STATUS -eq 0 ]; then
-  echo "[run.sh] ✅ Streak saved — $(date)"
+  echo "[run.sh] Streak saved — $(date)"
 else
-  echo "[run.sh] ❌ Agent failed — $(date)"
+  echo "[run.sh] Agent failed — $(date)"
 fi
 
 exit $STATUS

@@ -3,7 +3,7 @@ test_model.py — sanity check for OpenCode Go models
 Tests: API key auth, text response, image/vision support
 
 Usage:
-  python test_model.py                         # tests kimi-k2.6 (default)
+  python test_model.py                         # tests deepseek-v4-flash (default)
   python test_model.py qwen3.6-plus
   python test_model.py kimi-k2.6 qwen3.6-plus deepseek-v4-flash
   python test_model.py --all
@@ -225,6 +225,6 @@ if __name__ == "__main__":
     args     = sys.argv[1:]
     debug    = "--debug" in args
     args     = [a for a in args if a != "--debug"]
-    models   = ALL_MODELS if "--all" in args else (args or ["kimi-k2.6"])
+    models   = ALL_MODELS if "--all" in args else (args or ["deepseek-v4-flash"])
 
     run(models, api_key, debug=debug)

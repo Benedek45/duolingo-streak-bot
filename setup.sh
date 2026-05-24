@@ -2,31 +2,26 @@
 # setup.sh — one-time setup for the Duolingo agent
 set -euo pipefail
 
-echo "=== 1. Cloning android-mcp-server ==="
-if [ ! -d "android-mcp-server" ]; then
-  git clone https://github.com/minhalvp/android-mcp-server.git
-else
-  echo "  Already cloned, skipping."
+echo "=== 1. Checking Chromium ==="
+if ! command -v chromium >/dev/null 2>&1; then
+  echo "Chromium is required. Install it with: sudo apt install chromium"
+  exit 1
 fi
 
-echo "=== 2. Installing MCP server Python deps ==="
-cd android-mcp-server
-uv python install 3.11
-uv sync
-cd ..
+echo "=== 2. Checking Node/npx for Playwright MCP ==="
+if ! command -v npx >/dev/null 2>&1; then
+  echo "npx is required for @playwright/mcp. Install Node.js 18+ and npm."
+  exit 1
+fi
 
-echo "=== 3. Writing android-mcp-server/config.yaml ==="
-cat > android-mcp-server/config.yaml << 'YAML'
-device:
-  name: "localhost:5555"
-YAML
+echo "=== 3. Installing Python deps ==="
+pip install -r requirements.txt --break-system-packages
 
-echo "=== 4. Installing agent Python deps ==="
-pip install openai-agents --break-system-packages
+echo "=== 4. Checking Playwright MCP ==="
+npx --yes @playwright/mcp@latest --version >/dev/null
 
 echo ""
 echo "Done. Next steps:"
 echo "  1. cp .env.example .env && fill in your keys"
-echo "  2. docker compose up -d"
-echo "  3. Open http://localhost:6080, install Duolingo, log in once"
-echo "  4. ./run.sh"
+echo "  2. AGENT_DRY_RUN=1 ./run.sh"
+echo "  3. ./run.sh"

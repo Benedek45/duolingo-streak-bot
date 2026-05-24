@@ -1,8 +1,3 @@
-param(
-    [string]$AdbHost = "localhost",
-    [int]$AdbPort = 5555
-)
-
 # Load .env
 if (Test-Path ".env") {
     Get-Content ".env" | ForEach-Object {
@@ -14,23 +9,7 @@ if (Test-Path ".env") {
     }
 }
 
-Write-Host "[run.ps1] Waiting for emulator ADB..."
-$connected = $false
-for ($i = 1; $i -le 20; $i++) {
-    $state = adb -s "${AdbHost}:${AdbPort}" get-state 2>$null
-    if ($state -eq "device") {
-        Write-Host "[run.ps1] Emulator ready."
-        $connected = $true
-        break
-    }
-    Write-Host "[run.ps1] Not ready yet ($i/20)..."
-    Start-Sleep -Seconds 10
-}
-
-if (-not $connected) {
-    Write-Host "[run.ps1] Emulator did not become ready in time."
-    exit 1
-}
+New-Item -ItemType Directory -Force -Path "logs" | Out-Null
 
 python agent.py
 $status = $LASTEXITCODE
