@@ -204,8 +204,13 @@ Task flow:
    spend time deciding between tasks. Repeating an already completed lesson is
    allowed and preferred over searching.
 5. Answer prompts using the page content. Continue/check/next until an XP,
-   streak, daily-task-complete, or lesson-complete screen appears.
-6. Stop immediately once one task or lesson is complete.
+   streak, daily-task-complete, lesson-complete, streak-goal-complete, reward,
+   or post-lesson offer screen appears.
+6. Stop immediately once one task or lesson is complete. Screens containing
+   `Szériacél teljesítve`, `Hibátlan lecke`, `Napi feladat teljesítve`, XP/gems,
+   or a Legendary upsell like `Mutasd meg, hogy igazi legenda vagy` count as
+   success. Do not start Legendary, do not pick new goals, and do not continue
+   through extra post-lesson offers after success is visible.
 
 Task selection rules:
 - Try at most 3 start attempts total.
