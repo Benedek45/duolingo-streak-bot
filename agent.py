@@ -13,7 +13,7 @@ import os
 import shutil
 from pathlib import Path
 
-from openai import AsyncOpenAI
+from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
 from openai.resources.chat.completions import AsyncCompletions
 from agents import Agent, ModelSettings, Runner, function_tool
 from agents.mcp import MCPServerStdio
@@ -69,6 +69,8 @@ VISION_MODEL = os.environ.get("VISION_MODEL", "qwen3.5-plus")
 MAX_TURNS = int(os.environ.get("MAX_TURNS", "150"))
 MODEL_MAX_TOKENS = int(os.environ.get("MODEL_MAX_TOKENS", "1200"))
 VISION_MAX_TOKENS = int(os.environ.get("VISION_MAX_TOKENS", "500"))
+API_RETRIES = int(os.environ.get("API_RETRIES", "5"))
+API_RETRY_DELAY = float(os.environ.get("API_RETRY_DELAY", "3"))
 MODEL_INCLUDE_USAGE = env_bool("MODEL_INCLUDE_USAGE", True)
 QWEN_ENABLE_THINKING = env_bool("QWEN_ENABLE_THINKING", False)
 DRY_RUN = env_bool("AGENT_DRY_RUN", False)
@@ -121,7 +123,7 @@ OK if the task was already completed before; repeat a completed lesson/practice
 if that is the fastest available option.
 
 The available browser tools are provided by MCP. Use the browser_* tools directly:
-navigate, snapshot, click, fill form, press key, wait, screenshot, and related tools.
+navigate, snapshot, click, type, press key, wait, screenshot, and related tools.
 Prefer accessibility snapshots and exact element refs over coordinate clicks.
 
 Cost and context rules:
@@ -165,6 +167,21 @@ Important environment constraints:
 Credentials, only if the account is logged out:
 - email: {email}
 - password: {password}
+
+Login rules:
+- Prefer reusing an existing logged-in browser session. Only enter credentials if
+  Duolingo clearly shows the logged-out/login form.
+- During login, do not use browser_fill_form for credentials. Simulate normal
+  typing with browser_evaluate and the injected helper:
+  `async () => await window.__duolingoHumanType("selector", "value")`.
+- Type the email first, pause/check briefly, then type the password.
+- Before clicking the final login/submit button, call browser_take_screenshot,
+  then call analyze_latest_screenshot_with_qwen with a short question asking
+  whether this is the normal login form, which visible submit button should be
+  clicked, and whether there is an overlay/hidden alternate button or account
+  creation mode. Use that answer to choose the button.
+- If Duolingo says the account does not exist or the login UI is ambiguous, stop
+  and report the exact visible message instead of repeatedly retrying.
 
 Task flow:
 1. Navigate to {url}.
@@ -344,6 +361,7 @@ def write_mcp_config() -> None:
             "initScript": [
                 str(MCP_DIR / "windows-chrome-spoof.js"),
                 str(MCP_DIR / "duolingo-compact-view.js"),
+                str(MCP_DIR / "duolingo-human-type.js"),
                 str(MCP_DIR / "duolingo-auto-continue.js"),
             ],
             "initPage": [str(MCP_DIR / "duolingo-network-guard.ts")],
@@ -402,6 +420,14 @@ def sanitize_deepseek_messages(messages: list[dict]) -> list[dict]:
     return sanitized
 
 
+def should_retry_api_error(error: Exception) -> bool:
+    if isinstance(error, (APIConnectionError, APITimeoutError)):
+        return True
+    if isinstance(error, APIStatusError):
+        return error.status_code == 429 or error.status_code >= 500
+    return False
+
+
 def install_deepseek_compat() -> None:
     if getattr(AsyncCompletions.create, "_duolingo_deepseek_compat", False):
         return
@@ -411,7 +437,19 @@ def install_deepseek_compat() -> None:
         model = str(kwargs.get("model") or "")
         if model.startswith("deepseek") and isinstance(kwargs.get("messages"), list):
             kwargs = {**kwargs, "messages": sanitize_deepseek_messages(kwargs["messages"])}
-        return await original_create(self, *args, **kwargs)
+        last_error = None
+        for attempt in range(1, API_RETRIES + 1):
+            try:
+                return await original_create(self, *args, **kwargs)
+            except Exception as error:
+                last_error = error
+                if attempt >= API_RETRIES or not should_retry_api_error(error):
+                    raise
+                status = getattr(error, "status_code", type(error).__name__)
+                delay = API_RETRY_DELAY * attempt
+                print(f"\n[API retry] {model or 'model'} failed with {status}; retry {attempt}/{API_RETRIES - 1} in {delay:.1f}s", flush=True)
+                await asyncio.sleep(delay)
+        raise last_error
 
     create_with_deepseek_compat._duolingo_deepseek_compat = True
     AsyncCompletions.create = create_with_deepseek_compat
