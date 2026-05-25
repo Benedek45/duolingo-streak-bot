@@ -252,16 +252,34 @@ def tool_call_summary(item: object) -> str:
 async def print_streamed_events(result) -> None:
     print("[Agent] Streaming model output and browser tool activity. Hidden chain-of-thought is not exposed.")
     last_usage = None
+    model_text_buffer = ""
+    secret_tail = max((len(secret) for secret in [OPENCODE_GO_API_KEY, DUOLINGO_PASSWORD, DUOLINGO_EMAIL] if secret), default=0) + 16
+
+    def flush_model_text(force: bool = False) -> None:
+        nonlocal model_text_buffer
+        if not model_text_buffer:
+            return
+        keep = 0 if force else secret_tail
+        if len(model_text_buffer) <= keep:
+            return
+        printable = model_text_buffer[:-keep] if keep else model_text_buffer
+        model_text_buffer = model_text_buffer[-keep:] if keep else ""
+        print(redact(printable), end="", flush=True)
+
     async for event in result.stream_events():
         if isinstance(event, RawResponsesStreamEvent):
             usage = getattr(event.data, "usage", None)
             if usage is not None and usage != last_usage:
                 last_usage = usage
+                flush_model_text(force=True)
                 print(f"\n[Usage] {short_text(usage, 1000)}", flush=True)
             delta = getattr(event.data, "delta", None)
             if isinstance(delta, str) and delta:
-                print(delta, end="", flush=True)
+                model_text_buffer += delta
+                flush_model_text()
             continue
+
+        flush_model_text(force=True)
 
         if isinstance(event, AgentUpdatedStreamEvent):
             print(f"\n[Agent] switched to {event.new_agent.name}", flush=True)
@@ -281,6 +299,8 @@ async def print_streamed_events(result) -> None:
             print("\n[Reasoning] hidden by the model/API; showing actions and final output instead", flush=True)
         elif event.name == "message_output_created":
             print("\n[Message]", flush=True)
+
+    flush_model_text(force=True)
 
 
 def allowed_origins() -> list[str]:
@@ -471,6 +491,16 @@ def mcp_params() -> dict:
     }
 
 
+def cleanup_mcp_artifacts() -> None:
+    # MCP snapshots can include login form values. Keep the main transcript only.
+    for pattern in ["page-*.yml", "console-*.log", "page-*.png"]:
+        for path in LOG_DIR.glob(pattern):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
 async def dry_run() -> bool:
     write_mcp_config()
     async with MCPServerStdio(
@@ -498,32 +528,35 @@ async def run_agent() -> bool:
     client = AsyncOpenAI(api_key=OPENCODE_GO_API_KEY, base_url="https://opencode.ai/zen/go/v1")
     model = OpenAIChatCompletionsModel(model=AGENT_MODEL, openai_client=client)
 
-    async with MCPServerStdio(
-        params=mcp_params(),
-        cache_tools_list=True,
-        client_session_timeout_seconds=90,
-        tool_filter={"blocked_tool_names": sorted(BLOCKED_MCP_TOOLS)},
-    ) as mcp:
-        agent = Agent(
-            name="duolingo-browser-streak",
-            instructions=SYSTEM_PROMPT.format(
-                email=DUOLINGO_EMAIL,
-                password=DUOLINGO_PASSWORD,
-                url=DUOLINGO_URL,
-            ),
-            tools=[analyze_latest_screenshot_with_qwen],
-            mcp_servers=[mcp],
-            model=model,
-            model_settings=model_settings(),
-        )
-        result = Runner.run_streamed(
-            agent,
-            input="Start now. Navigate to Duolingo, complete any available daily task or lesson, then stop.",
-            max_turns=MAX_TURNS,
-        )
-        await print_streamed_events(result)
-        print(f"\n[Agent] {result.final_output}")
-        return True
+    try:
+        async with MCPServerStdio(
+            params=mcp_params(),
+            cache_tools_list=True,
+            client_session_timeout_seconds=90,
+            tool_filter={"blocked_tool_names": sorted(BLOCKED_MCP_TOOLS)},
+        ) as mcp:
+            agent = Agent(
+                name="duolingo-browser-streak",
+                instructions=SYSTEM_PROMPT.format(
+                    email=DUOLINGO_EMAIL,
+                    password=DUOLINGO_PASSWORD,
+                    url=DUOLINGO_URL,
+                ),
+                tools=[analyze_latest_screenshot_with_qwen],
+                mcp_servers=[mcp],
+                model=model,
+                model_settings=model_settings(),
+            )
+            result = Runner.run_streamed(
+                agent,
+                input="Start now. Navigate to Duolingo, complete any available daily task or lesson, then stop.",
+                max_turns=MAX_TURNS,
+            )
+            await print_streamed_events(result)
+            print(f"\n[Agent] {redact(result.final_output)}")
+            return True
+    finally:
+        cleanup_mcp_artifacts()
 
 
 if __name__ == "__main__":
