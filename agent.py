@@ -159,6 +159,16 @@ Batching:
   and inspect the next question instead. Still handle lesson-complete/reward
   screens yourself.
 
+Exercise failure rules:
+- Do not loop on one question. If two interaction attempts do not change the page
+  state or enable the Check button, click `KIHAGYÁS` / `[data-test="player-skip"]`
+  and continue the lesson.
+- For `challenge-tapComplete` fill-blank questions, first try clicking visible
+  word-bank tokens with browser_evaluate. If the same tokens remain and Check is
+  still disabled, skip the question instead of inspecting DOM repeatedly.
+- A skipped or wrong question is acceptable; completing the lesson/task matters
+  more than perfect score.
+
 Important environment constraints:
 - The browser is configured to look like Chrome on Windows 11.
 - Browser network requests may be broad/permissive when `DUOLINGO_ALLOWED_HOSTS=*`
