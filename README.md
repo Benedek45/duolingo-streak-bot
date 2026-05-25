@@ -44,7 +44,7 @@ BROWSER_EXECUTABLE=/usr/bin/chromium
 BROWSER_HEADLESS=true
 BROWSER_USER_DATA_DIR=.browser-profile
 DUOLINGO_URL=https://www.duolingo.com
-DUOLINGO_ALLOWED_HOSTS=duolingo.com,.duolingo.com,d1vq87e9lcf771.cloudfront.net,d35aaqx5ub95lt.cloudfront.net,d2pur3iezf4d1j.cloudfront.net,d3kwyfyztuo0xs.cloudfront.net
+DUOLINGO_ALLOWED_HOSTS=*
 ```
 
 ## Run
@@ -70,9 +70,8 @@ AGENT_DRY_RUN=1 ./run.sh
 4. Chromium is configured to look like Windows 11 Chrome with a Windows user
    agent, `navigator.platform`, `navigator.userAgentData`, language, hardware,
    `navigator.webdriver`, screen, and WebGL spoofing.
-5. A Playwright route guard aborts browser requests whose host is not in
-   `DUOLINGO_ALLOWED_HOSTS`. The MCP server's own `allowedOrigins` option is also
-   set, but the route guard is the stricter fail-closed protection.
+5. A Playwright route guard can restrict browser requests to `DUOLINGO_ALLOWED_HOSTS`.
+   Set `DUOLINGO_ALLOWED_HOSTS=*` to allow normal web/CAPTCHA/auth requests broadly.
 6. Browser profile data persists in `.browser-profile`.
 7. A compact page helper, `window.__duolingoCompactView()`, is injected so the
    model can inspect Duolingo without repeatedly sending full YAML snapshots.

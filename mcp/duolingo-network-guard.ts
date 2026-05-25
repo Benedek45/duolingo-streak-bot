@@ -4,6 +4,7 @@ export default async ({ page }) => {
     .split(",")
     .map((host) => host.trim().toLowerCase())
     .filter(Boolean);
+  const allowAllWeb = allowedHosts.includes("*");
 
   const isAllowedHost = (hostname) => {
     const host = hostname.toLowerCase();
@@ -25,7 +26,7 @@ export default async ({ page }) => {
       return;
     }
 
-    if (url.protocol === "https:" && isAllowedHost(url.hostname)) {
+    if ((url.protocol === "https:" || url.protocol === "http:") && (allowAllWeb || isAllowedHost(url.hostname))) {
       await route.continue();
       return;
     }

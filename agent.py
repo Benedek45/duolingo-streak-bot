@@ -91,8 +91,9 @@ HEADLESS = env_bool(
 USER_DATA_DIR = Path(os.environ.get("BROWSER_USER_DATA_DIR", ROOT / ".browser-profile"))
 MCP_VISION = env_bool("MCP_VISION", False)
 
-# Fail closed. Add extra hosts with DUOLINGO_ALLOWED_HOSTS if Duolingo introduces
-# a new CDN/auth host. Host entries may be exact names or suffixes prefixed by a dot.
+# Add extra hosts with DUOLINGO_ALLOWED_HOSTS if Duolingo introduces a new CDN/auth
+# host. Host entries may be exact names, suffixes prefixed by a dot, or "*" to
+# allow all normal http/https web requests.
 DEFAULT_ALLOWED_HOSTS = [
     "duolingo.com",
     ".duolingo.com",
@@ -106,6 +107,7 @@ ALLOWED_HOSTS = [
     for host in os.environ.get("DUOLINGO_ALLOWED_HOSTS", ",".join(DEFAULT_ALLOWED_HOSTS)).split(",")
     if host.strip()
 ]
+ALLOW_ALL_WEB = "*" in ALLOWED_HOSTS
 
 BLOCKED_MCP_TOOLS = {
     "browser_run_code_unsafe",
@@ -159,10 +161,10 @@ Batching:
 
 Important environment constraints:
 - The browser is configured to look like Chrome on Windows 11.
-- Browser network requests are allowlisted to Duolingo-owned/API hosts and known
-  Duolingo CDN hosts. Do not try to browse elsewhere.
-- If a required Duolingo asset is blocked, report the blocked host instead of
-  working around the guardrail.
+- Browser network requests may be broad/permissive when `DUOLINGO_ALLOWED_HOSTS=*`
+  is configured so reCAPTCHA and external auth scripts can load. Still do not
+  browse unrelated sites except auth/CAPTCHA resources required by Duolingo.
+- If a required Duolingo/auth asset is blocked, report the blocked host.
 
 Credentials, only if the account is logged out:
 - email: {email}
@@ -321,6 +323,8 @@ async def print_streamed_events(result) -> None:
 
 
 def allowed_origins() -> list[str]:
+    if ALLOW_ALL_WEB:
+        return []
     origins = {"https://duolingo.com", "https://www.duolingo.com"}
     for host in ALLOWED_HOSTS:
         if host.startswith("."):
@@ -367,10 +371,11 @@ def write_mcp_config() -> None:
             "initPage": [str(MCP_DIR / "duolingo-network-guard.ts")],
         },
         "capabilities": ["core"] + (["vision"] if MCP_VISION else []),
-        "network": {"allowedOrigins": allowed_origins()},
         "outputDir": str(LOG_DIR),
         "timeouts": {"action": 10000, "navigation": 90000},
     }
+    if not ALLOW_ALL_WEB:
+        config["network"] = {"allowedOrigins": allowed_origins()}
     if MCP_VISION:
         config["imageResponses"] = "allow"
     CONFIG_PATH.write_text(json.dumps(config, indent=2) + "\n")
